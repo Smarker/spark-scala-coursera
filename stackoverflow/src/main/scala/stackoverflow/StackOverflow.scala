@@ -20,11 +20,12 @@ object StackOverflow extends StackOverflow {
   /** Main function */
   def main(args: Array[String]): Unit = {
 
-    val lines   = sc.textFile("src/main/resources/stackoverflow/stackoverflow.csv")
-    val raw     = rawPostings(lines)
-    val grouped = groupedPostings(raw)
-    val scored  = scoredPostings(grouped)
-    val vectors = vectorPostings(scored)
+    val lines   = sc.textFile("src/main/resources/stackoverflow/stackoverflow.csv") //lines from csv as strings
+    val raw     = rawPostings(lines) //raw posting entries for each line
+    val grouped = groupedPostings(raw) //questions and answers grouped together
+    val scored  = scoredPostings(grouped) //questions and scores
+    val vectors = vectorPostings(scored) //pairs of (language, score) for each question
+
 //    assert(vectors.count() == 2121822, "Incorrect number of vectors: " + vectors.count())
 
     val means   = kmeans(sampleVectors(vectors), vectors, debug = true)
@@ -77,8 +78,36 @@ class StackOverflow extends Serializable {
 
 
   /** Group the questions and answers together */
+  //def groupedPostings(postings: RDD[/* Question or Answer */ Posting]):
+  //RDD[(/*QID*/ Int, Iterable[(/*Question*/ Posting, /*Answer*/ Posting)])]
   def groupedPostings(postings: RDD[Posting]): RDD[(Int, Iterable[(Posting, Posting)])] = {
-    ???
+    /*
+    Have: RDD[Posting] <- postings
+    Want: RDD[(Int, Iterable[(Posting, Posting)]
+
+    questions have postTypeId == 1 (with question id QID)
+    answers have postTypeId == 2 AND parentId == QID
+
+    grouping on the question directly is expensive since you would have to shuffle a lot
+
+    a better alternative to grouping would be to match on the QID (join)
+
+    1. filter the questions and answers separately and then prep them for a join by extracting the QID value in the first element of
+    the tuple
+    2. use a join operation (which one?) to get an RDD[(QID, (Question, Answer))]
+    3. obtain a RDD[(QID, Iterable[(Question, Answer)])] by grouping by a key of a pair RDD
+     */
+
+    val questions = postings
+      .filter(question => {question.postingType == 1})
+      .map(question => (question.id, question)) //(QID, Question)
+    val answers = postings
+      .filter(answer => {answer.postingType == 2 && answer.parentId.isDefined})
+      .map(answer => (answer.parentId.get, answer)) //(QID, Answer)
+
+    questions
+      .join(answers)
+      .groupByKey() //(QID,[(Question, Answer),...])
   }
 
 
@@ -97,7 +126,11 @@ class StackOverflow extends Serializable {
       highScore
     }
 
-    ???
+    //replace value with pair that has the highest score for answer posting
+    grouped
+      .flatMap(_._2) //this puts all the iterable[]'s into one collection of postings ((q, a), (q, a), ...)
+      .groupByKey() //this groups the postings by question (q, [a1, a2, a3]), (q2, [a6, a8]), ...
+      .mapValues(a => answerHighScore(a.toArray)) //this gets the high score of the answers array
   }
 
 
@@ -117,7 +150,16 @@ class StackOverflow extends Serializable {
       }
     }
 
-    ???
+    /*
+    (index of the language * langSpread, high score)
+    use the firstlangintag helper
+
+    if you test check that the scored rdd should have 2121822 entries
+    */
+
+    scored.map( languageScorePair => {
+      ( firstLangInTag(languageScorePair._1.tags, langs ).get * langSpread, languageScorePair._2)
+    }).cache()
   }
 
 
@@ -172,7 +214,25 @@ class StackOverflow extends Serializable {
 
   /** Main kmeans computation */
   @tailrec final def kmeans(means: Array[(Int, Int)], vectors: RDD[(Int, Int)], iter: Int = 1, debug: Boolean = false): Array[(Int, Int)] = {
-    val newMeans = means.clone() // you need to compute newMeans
+    //compute the new means by averaging the values of each cluster.
+    //means: k means chosen, vectors: all other points
+
+    /*
+    for each vector in vectors, findClosest mean
+      create a pair of (closestmean, vector)
+      groupbykey so you have (closestmean, [vector1, vector2,...]
+      for each of those values by compute the averageVectors and return those averages as the new means
+    */
+
+    val newMeans = means.clone()
+
+    vectors.map( vector => {
+      (findClosest(vector, means), vector) //(index of closest mean: Int, vector (Int, Int))
+    }).groupByKey() //(closestmean, [vector1, vector2,...]
+      .mapValues(averageVectors) //(closestmean, newmean)
+      .collect().foreach(pair => {
+       newMeans.update(pair._1, pair._2) //replace values of means with new means and use update to maintain same length in case of no points
+    }) //new mean array
 
     // TODO: Fill in the newMeans array
     val distance = euclideanDistance(means, newMeans)
@@ -269,14 +329,36 @@ class StackOverflow extends Serializable {
   //
   //
   def clusterResults(means: Array[(Int, Int)], vectors: RDD[(Int, Int)]): Array[(String, Double, Int, Int)] = {
-    val closest = vectors.map(p => (findClosest(p, means), p))
-    val closestGrouped = closest.groupByKey()
+    val closest = vectors.map(p => (findClosest(p, means), p)) //(closest mean, vector)
+    val closestGrouped = closest.groupByKey() //(closest mean, [vectors close to that mean])
 
-    val median = closestGrouped.mapValues { vs =>
-      val langLabel: String   = ??? // most common language in the cluster
-      val langPercent: Double = ??? // percent of the questions in the most common language
-      val clusterSize: Int    = ???
-      val medianScore: Int    = ???
+    def computeMedian(scores: Seq[Int]): Int = {
+      val len = scores.size
+
+      val sortedScores = scores.sortWith(_ < _)
+      println(sortedScores)
+
+      if(len % 2 == 0) { //take average
+        (sortedScores(len / 2) + sortedScores(len / 2 - 1)) / 2
+      } else {
+        sortedScores(len / 2)
+      }
+    }
+
+    val median = closestGrouped.mapValues { vs => //vectors
+
+      //for each [] of vectors, get language -> # occurrences
+      val languageToNumOccurrence: Map[Int, Int] = vs
+        .map(_._1 / langSpread) // get original index by dividing by langSpread
+        .groupBy(identity) // group by the index https://stackoverflow.com/questions/11448685/scala-how-can-i-count-the-number-of-occurrences-in-a-list
+        .mapValues(_.size) // get sizes
+
+      val mostCommonLangIdx = languageToNumOccurrence.maxBy(_._2)._1
+
+      val langLabel: String   = langs(mostCommonLangIdx) // most common language in the cluster
+      val langPercent: Double = languageToNumOccurrence(mostCommonLangIdx) * 100.0d / vs.size // percent of the questions in the most common language
+      val clusterSize: Int    = vs.size
+      val medianScore: Int    = computeMedian(vs.map(v => v._2).toSeq)
 
       (langLabel, langPercent, clusterSize, medianScore)
     }

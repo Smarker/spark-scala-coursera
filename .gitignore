@@ -1,4 +1,10 @@
-*.class
 *.log
 *.csv
 *.dat
+target
+*.class
+*.iml
+*.ipr
+*.iws
+.idea
+out
